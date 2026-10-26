@@ -1,340 +1,37 @@
 // ==UserScript==
-// @name         DOC - Delivery Operations Copilot Prototype
-// @namespace    levelaccess.delivery.doc
-// @version      0.1.0
-// @description  Context-aware delivery intelligence prototype for Jira, Tempo, Confluence, SharePoint and reporting pages.
-// @match        https://*.atlassian.net/*
-// @match        https://*.sharepoint.com/*
-// @match        https://app.powerbi.com/*
-// @grant        GM_addStyle
-// @grant        GM_setValue
-// @grant        GM_getValue
-// @grant        GM_deleteValue
-// @run-at       document-idle
+// @name DOC - Delivery Operations Copilot
+// @namespace levelaccess.delivery.doc
+// @version 0.4.0
+// @match https://*.atlassian.net/*
+// @grant GM_addStyle
+// @grant GM_setValue
+// @grant GM_getValue
+// @run-at document-idle
 // ==/UserScript==
-
-(() => {
-  'use strict';
-
-  const APP = { name: 'Delivery Operations Copilot', short: 'DOC', version: '0.1.0' };
-  const STORE = { capacity: 'doc.capacity.v1', settings: 'doc.settings.v1', rules: 'doc.rules.v1' };
-  const DEFAULT_RULES = {
-    standardWorkdayHours: 7,
-    evaluationHoursPerPage: 4.5,
-    validationDefaultHoursPerFinding: 0.25,
-    scopingHours: 10,
-    triageSetupHours: 2,
-    finalReviewHours: 0.5,
-    planningWindowWeeks: 3,
-    warningUtilizationPct: 90,
-    criticalUtilizationPct: 110,
-    staleSourceDays: 7
-  };
-
-  const state = {
-    context: null,
-    scan: null,
-    capacity: load(STORE.capacity, []),
-    rules: { ...DEFAULT_RULES, ...load(STORE.rules, {}) },
-    panelOpen: true,
-    activeTab: 'overview'
-  };
-
-  function load(key, fallback) {
-    try {
-      const raw = typeof GM_getValue === 'function' ? GM_getValue(key) : localStorage.getItem(key);
-      return raw ? JSON.parse(raw) : fallback;
-    } catch { return fallback; }
-  }
-
-  function save(key, value) {
-    const raw = JSON.stringify(value);
-    if (typeof GM_setValue === 'function') GM_setValue(key, raw);
-    else localStorage.setItem(key, raw);
-  }
-
-  const text = el => (el?.textContent || '').replace(/\s+/g, ' ').trim();
-  const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  const number = value => {
-    const parsed = Number(String(value ?? '').replace(/[^0-9.-]/g, ''));
-    return Number.isFinite(parsed) ? parsed : null;
-  };
-  const dateValue = value => {
-    const direct = new Date(value);
-    if (!Number.isNaN(direct.getTime())) return direct;
-    const serial = Number(value);
-    if (Number.isFinite(serial) && serial > 25000) return new Date(Date.UTC(1899, 11, 30) + serial * 86400000);
-    return null;
-  };
-  const formatDate = date => date instanceof Date && !Number.isNaN(date) ? date.toLocaleDateString() : 'Unknown';
-  const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
-
-  function detectPage() {
-    const host = location.hostname;
-    const path = location.pathname;
-    const title = document.title;
-    let system = 'unknown', type = 'unknown';
-    if (/atlassian\.net$/.test(host)) {
-      system = 'atlassian';
-      if (/\/browse\/[A-Z][A-Z0-9]+-\d+/i.test(path) || document.querySelector('[data-testid="issue.views.issue-base.foundation.breadcrumbs.current-issue.item"]')) type = 'jira-issue';
-      else if (/tempo/i.test(path + title)) type = 'tempo';
-      else if (/\/jira\/software\/c\/projects\/.+\/boards\//i.test(path)) type = 'jira-board';
-      else if (/\/issues\//i.test(path)) type = 'jira-search';
-      else if (/\/wiki\//i.test(path)) type = 'confluence';
-      else type = 'atlassian-other';
-    } else if (/sharepoint\.com$/.test(host)) { system = 'microsoft'; type = 'sharepoint'; }
-    else if (/powerbi\.com$/.test(host)) { system = 'microsoft'; type = 'powerbi'; }
-    return { system, type, host, path, title, url: location.href, detectedAt: new Date().toISOString() };
-  }
-
-  function firstText(selectors) {
-    for (const selector of selectors) {
-      const value = text([...document.querySelectorAll(selector)].find(visible));
-      if (value) return value;
-    }
-    return '';
-  }
-
-  function fieldByLabel(labelPattern) {
-    const candidates = [...document.querySelectorAll('label, dt, [data-testid*="field"], [class*="field"]')].filter(visible);
-    for (const candidate of candidates) {
-      const label = text(candidate);
-      if (!labelPattern.test(label) || label.length > 120) continue;
-      const control = candidate.querySelector('input, textarea, select, [contenteditable="true"]');
-      if (control) return control.value || text(control);
-      const parent = candidate.closest('div, section, dl') || candidate.parentElement;
-      if (parent) {
-        const values = [...parent.querySelectorAll('dd, input, textarea, select, [data-testid*="value"], [class*="value"]')].map(el => el.value || text(el)).filter(Boolean);
-        if (values.length) return values[values.length - 1];
-      }
-    }
-    return '';
-  }
-
-  function extractJiraIssue() {
-    const key = location.pathname.match(/\/browse\/([A-Z][A-Z0-9]+-\d+)/i)?.[1]
-      || firstText(['[data-testid*="current-issue"]', '[data-testid*="issue-key"]']);
-    const summary = firstText(['h1', '[data-testid*="summary"]']);
-    const status = firstText(['[data-testid*="status"] button', '[data-testid*="status"]', '[id*="status"]']);
-    const assignee = fieldByLabel(/^assignee$/i) || firstText(['[data-testid*="assignee"]']);
-    const dueDate = fieldByLabel(/^due date$/i) || firstText(['[data-testid*="due-date"]']);
-    const pageCountRaw = fieldByLabel(/^(estimated )?(pages|modules|page count)$/i);
-    const requestType = fieldByLabel(/^(request|service|issue) type$/i);
-    const priority = fieldByLabel(/^priority$/i);
-    return { key, summary, status, assignee, dueDate, pageCount: number(pageCountRaw), requestType, priority, sourceUrl: location.href };
-  }
-
-  function inspectPage() {
-    const interactive = [...document.querySelectorAll('button, [role="button"], details, [aria-expanded], [role="tab"], select')].filter(visible);
-    const pagination = interactive.filter(el => /next|previous|page \d|show more|load more/i.test(text(el) + ' ' + (el.getAttribute('aria-label') || '')));
-    const accordions = interactive.filter(el => el.tagName === 'DETAILS' || el.hasAttribute('aria-expanded'));
-    const rows = [...document.querySelectorAll('table tbody tr, [role="row"]')].filter(visible);
-    const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(visible);
-    return { rows: rows.length, interactive: interactive.length, pagination: pagination.length, accordions: accordions.length, dialogs: dialogs.length, capturedAt: new Date().toISOString() };
-  }
-
-  async function deepScan() {
-    const abort = new AbortController();
-    state.scanAbort = abort;
-    updateStatus('Deep scan running. Use Cancel to stop.');
-    const result = { pagesVisited: 1, expanded: 0, rows: [], warnings: [], startedAt: new Date().toISOString() };
-    const collect = () => {
-      const seen = new Set(result.rows.map(r => r.join('\u241f')));
-      [...document.querySelectorAll('table tbody tr, [role="row"]')].filter(visible).forEach(row => {
-        const cells = [...row.querySelectorAll('th, td, [role="cell"], [role="gridcell"]')].map(text).filter(Boolean);
-        const sig = cells.join('\u241f');
-        if (cells.length && !seen.has(sig)) { seen.add(sig); result.rows.push(cells); }
-      });
-    };
-    const waitStable = (ms = 650) => new Promise(resolve => setTimeout(resolve, ms));
-    try {
-      collect();
-      const expanders = [...document.querySelectorAll('[aria-expanded="false"], details:not([open]) summary')].filter(visible).slice(0, 100);
-      for (const el of expanders) {
-        if (abort.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-        if (/delete|remove|archive|close|submit|save/i.test(text(el))) continue;
-        el.click(); result.expanded++; await waitStable(150); collect();
-      }
-      for (let i = 0; i < 50; i++) {
-        if (abort.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-        const next = [...document.querySelectorAll('button, [role="button"], a')].find(el => visible(el) && !el.disabled && /^(next|load more|show more)$/i.test((el.getAttribute('aria-label') || text(el)).trim()));
-        if (!next) break;
-        next.click(); result.pagesVisited++; await waitStable(); collect();
-      }
-      result.completedAt = new Date().toISOString();
-      state.scan = result;
-      updateStatus(`Deep scan complete: ${result.rows.length} rows captured across ${result.pagesVisited} page state(s).`);
-    } catch (error) {
-      result.cancelled = error?.name === 'AbortError';
-      result.completedAt = new Date().toISOString();
-      state.scan = result;
-      updateStatus(result.cancelled ? 'Deep scan cancelled.' : `Scan stopped: ${error.message}`);
-    }
-    render();
-  }
-
-  function parseCsv(input) {
-    const rows = [];
-    let row = [], cell = '', quote = false;
-    for (let i = 0; i < input.length; i++) {
-      const c = input[i], n = input[i + 1];
-      if (c === '"' && quote && n === '"') { cell += '"'; i++; }
-      else if (c === '"') quote = !quote;
-      else if (c === ',' && !quote) { row.push(cell); cell = ''; }
-      else if ((c === '\n' || c === '\r') && !quote) {
-        if (c === '\r' && n === '\n') i++;
-        row.push(cell); if (row.some(v => v.trim())) rows.push(row); row = []; cell = '';
-      } else cell += c;
-    }
-    row.push(cell); if (row.some(v => v.trim())) rows.push(row);
-    return rows;
-  }
-
-  const norm = value => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-  function findHeader(rows) {
-    return rows.findIndex(row => row.some(cell => /consultant|employee|person|name/i.test(cell)) && row.some(cell => /capacity|booked|assigned/i.test(cell)));
-  }
-  function importCapacityCsv(csv) {
-    const rows = parseCsv(csv);
-    const hi = findHeader(rows);
-    if (hi < 0) throw new Error('Could not locate a capacity header row. Include Consultant and capacity/workload columns.');
-    const headers = rows[hi].map(norm);
-    const pick = (record, patterns) => {
-      const i = headers.findIndex(h => patterns.some(p => p.test(h)));
-      return i >= 0 ? record[i] : '';
-    };
-    const records = rows.slice(hi + 1).map(record => {
-      const name = pick(record, [/^consultant$/, /^employee$/, /^person$/, /^name$/]);
-      if (!name || /available capacity|demand evals|missing items/i.test(name)) return null;
-      return {
-        name: name.trim(),
-        testingCapacityPct: number(pick(record, [/testing capacity/, /^capacity %$/, /^capacity$/])),
-        pagesAssigned: number(pick(record, [/pages ass/ , /assigned pages/])),
-        evaluationHours: number(pick(record, [/eval total/, /evaluation hours/])),
-        validationFindings: number(pick(record, [/validation findings/])),
-        validationHoursPerFinding: number(pick(record, [/validation time/, /hours per finding/])),
-        validationHours: number(pick(record, [/validation total/, /validation hours/])),
-        vpatCount: number(pick(record, [/vpat authoring/, /vpat count/])),
-        vpatHours: number(pick(record, [/vpat total/, /vpat hours/])),
-        bookedHours: number(pick(record, [/^booked$/, /booked hours/])),
-        ftoHours: number(pick(record, [/^fto$/, /pto/])),
-        holidayHours: number(pick(record, [/holiday/])),
-        firstAvailableDate: pick(record, [/first available/]),
-        notes: pick(record, [/employee spoken time/, /^notes?$/]),
-        potentialPages: number(pick(record, [/potential pages/])),
-        potentialHoursLeft: number(pick(record, [/potential hours/])),
-        smeHours: number(pick(record, [/sme hours/])),
-        importedAt: new Date().toISOString()
-      };
-    }).filter(Boolean);
-    state.capacity = records;
-    save(STORE.capacity, records);
-    return records;
-  }
-
-  function estimateIssue(issue) {
-    const pages = issue?.pageCount;
-    if (!Number.isFinite(pages)) return null;
-    const testing = pages * state.rules.evaluationHoursPerPage;
-    return { pages, testing, total: testing + state.rules.scopingHours + state.rules.triageSetupHours + state.rules.finalReviewHours };
-  }
-
-  function capacityMetrics(person) {
-    const pct = person.testingCapacityPct || 0;
-    const supply = state.rules.standardWorkdayHours * 5 * state.rules.planningWindowWeeks * pct / 100;
-    const demand = person.bookedHours ?? ((person.evaluationHours || 0) + (person.validationHours || 0) + (person.vpatHours || 0) + (person.smeHours || 0) + (person.ftoHours || 0) + (person.holidayHours || 0));
-    const remaining = supply - demand;
-    const utilization = supply > 0 ? demand / supply * 100 : null;
-    return { supply, demand, remaining, utilization };
-  }
-
-  function recommendations() {
-    const issue = state.context?.issue;
-    const recs = [];
-    const estimate = estimateIssue(issue);
-    if (state.context?.page.type === 'jira-issue') {
-      if (!issue?.dueDate) recs.push({ level: 'warning', title: 'Due date missing', detail: 'This work item has no detected due date. Confirm the delivery commitment before planning capacity.' });
-      if (!issue?.assignee) recs.push({ level: 'critical', title: 'Assignee missing', detail: 'No assignee was detected for this work item.' });
-      if (!Number.isFinite(issue?.pageCount)) recs.push({ level: 'info', title: 'Scope not detected', detail: 'DOC could not detect a page or module count, so effort guidance is unavailable.' });
-      if (estimate) recs.push({ level: 'info', title: 'Reference effort', detail: `${estimate.pages} pages × ${state.rules.evaluationHoursPerPage} hours/page plus scoping, setup, and review equals ${estimate.total.toFixed(1)} reference hours.` });
-      const match = state.capacity.find(p => issue?.assignee && (norm(issue.assignee).includes(norm(p.name)) || norm(p.name).includes(norm(issue.assignee))));
-      if (match) {
-        const m = capacityMetrics(match);
-        const level = m.utilization >= state.rules.criticalUtilizationPct ? 'critical' : m.utilization >= state.rules.warningUtilizationPct ? 'warning' : 'success';
-        recs.push({ level, title: `${match.name} capacity`, detail: `${m.demand.toFixed(1)} planned hours against ${m.supply.toFixed(1)} reference hours (${m.utilization.toFixed(0)}%).` });
-        if (estimate && m.remaining < estimate.total) recs.push({ level: 'warning', title: 'Capacity conflict', detail: `The reference estimate exceeds ${match.name}'s remaining three-week capacity by ${(estimate.total - m.remaining).toFixed(1)} hours.` });
-      }
-    }
-    if (!state.capacity.length) recs.push({ level: 'info', title: 'Capacity data not loaded', detail: 'Import the capacity CSV to enable person and team recommendations.' });
-    return recs;
-  }
-
-  function rosterHtml() {
-    if (!state.capacity.length) return '<p class="doc-empty">No capacity data imported.</p>';
-    return `<div class="doc-roster">${state.capacity.map(p => {
-      const m = capacityMetrics(p); const level = m.utilization >= state.rules.criticalUtilizationPct ? 'critical' : m.utilization >= state.rules.warningUtilizationPct ? 'warning' : 'success';
-      return `<article class="doc-card"><div class="doc-row"><strong>${escapeHtml(p.name)}</strong><span class="doc-badge ${level}">${m.utilization == null ? 'N/A' : m.utilization.toFixed(0) + '%'}</span></div><div class="doc-mini">${m.demand.toFixed(1)} booked / ${m.supply.toFixed(1)} reference hrs</div><div class="doc-meter"><span style="width:${Math.min(100, Math.max(0, m.utilization || 0))}%"></span></div><div class="doc-mini">Available: ${escapeHtml(p.firstAvailableDate || 'Not provided')}</div></article>`;
-    }).join('')}</div>`;
-  }
-
-  function contextHtml() {
-    const c = state.context; const issue = c.issue || {};
-    return `<dl class="doc-kv"><div><dt>System</dt><dd>${escapeHtml(c.page.system)}</dd></div><div><dt>Page type</dt><dd>${escapeHtml(c.page.type)}</dd></div>${c.page.type === 'jira-issue' ? `<div><dt>Issue</dt><dd>${escapeHtml(issue.key || 'Not detected')}</dd></div><div><dt>Status</dt><dd>${escapeHtml(issue.status || 'Not detected')}</dd></div><div><dt>Assignee</dt><dd>${escapeHtml(issue.assignee || 'Not detected')}</dd></div><div><dt>Due date</dt><dd>${escapeHtml(issue.dueDate || 'Not detected')}</dd></div><div><dt>Pages</dt><dd>${issue.pageCount ?? 'Not detected'}</dd></div>` : ''}</dl>`;
-  }
-
-  function insightsHtml() {
-    const recs = recommendations();
-    return recs.map(r => `<article class="doc-insight ${r.level}"><h3>${escapeHtml(r.title)}</h3><p>${escapeHtml(r.detail)}</p></article>`).join('') || '<p class="doc-empty">No recommendations for the current context.</p>';
-  }
-
-  function scanHtml() {
-    const s = state.context.scan;
-    return `<div class="doc-card"><p><strong>Current page</strong></p><ul><li>${s.rows} visible data rows</li><li>${s.pagination} pagination controls</li><li>${s.accordions} expandable controls</li><li>${s.interactive} interactive elements</li></ul><div class="doc-actions"><button data-action="quick">Quick Scan</button><button data-action="deep">Deep Scan</button><button data-action="cancel">Cancel</button></div></div>${state.scan ? `<div class="doc-card"><strong>Last scan</strong><p>${state.scan.rows?.length || 0} rows, ${state.scan.pagesVisited || 1} page states, ${state.scan.expanded || 0} expanded controls.</p><button data-action="export-scan">Export Scan JSON</button></div>` : ''}`;
-  }
-
-  function settingsHtml() {
-    return `<div class="doc-card"><label>Import capacity CSV<input id="doc-csv" type="file" accept=".csv,text/csv"></label><p class="doc-mini">The parser maps common Apollo headers and stores normalized data locally in this browser.</p></div><div class="doc-card"><h3>Rules</h3>${Object.entries(state.rules).map(([k,v]) => `<label>${escapeHtml(k)}<input data-rule="${escapeHtml(k)}" type="number" step="0.01" value="${v}"></label>`).join('')}<button data-action="save-rules">Save Rules</button></div><div class="doc-card"><button data-action="clear">Clear Local DOC Data</button></div>`;
-  }
-
-  function render() {
-    let root = document.getElementById('doc-root');
-    if (!root) { root = document.createElement('section'); root.id = 'doc-root'; root.setAttribute('aria-label', APP.name); document.body.appendChild(root); }
-    const tabs = ['overview','capacity','scan','settings'];
-    const content = state.activeTab === 'overview' ? `<h2>Current Context</h2>${contextHtml()}<h2>Guidance</h2>${insightsHtml()}` : state.activeTab === 'capacity' ? `<h2>Capacity</h2>${rosterHtml()}` : state.activeTab === 'scan' ? `<h2>Page Scanner</h2>${scanHtml()}` : `<h2>Settings</h2>${settingsHtml()}`;
-    root.className = state.panelOpen ? 'open' : 'closed';
-    root.innerHTML = `<button id="doc-toggle" aria-expanded="${state.panelOpen}" aria-controls="doc-panel"><span aria-hidden="true">DOC</span><span class="sr-only">${state.panelOpen ? 'Close' : 'Open'} Delivery Operations Copilot</span></button><div id="doc-panel"><header><div><strong>DOC</strong><span>Delivery Operations Copilot</span></div><small>Prototype ${APP.version}</small></header><nav aria-label="DOC views">${tabs.map(t => `<button data-tab="${t}" aria-current="${state.activeTab===t?'page':'false'}">${t[0].toUpperCase()+t.slice(1)}</button>`).join('')}</nav><main>${content}</main><footer id="doc-status" role="status">Ready</footer></div>`;
-    bind();
-  }
-
-  function updateStatus(message) { const el = document.getElementById('doc-status'); if (el) el.textContent = message; }
-  function download(name, data, type = 'application/json') {
-    const blob = new Blob([data], { type }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  }
-  function bind() {
-    document.getElementById('doc-toggle')?.addEventListener('click', () => { state.panelOpen = !state.panelOpen; render(); });
-    document.querySelectorAll('#doc-root [data-tab]').forEach(b => b.addEventListener('click', () => { state.activeTab = b.dataset.tab; render(); }));
-    document.querySelector('#doc-root [data-action="quick"]')?.addEventListener('click', () => { state.context = collectContext(); updateStatus('Quick scan refreshed.'); render(); });
-    document.querySelector('#doc-root [data-action="deep"]')?.addEventListener('click', deepScan);
-    document.querySelector('#doc-root [data-action="cancel"]')?.addEventListener('click', () => state.scanAbort?.abort());
-    document.querySelector('#doc-root [data-action="export-scan"]')?.addEventListener('click', () => download(`doc-scan-${Date.now()}.json`, JSON.stringify(state.scan, null, 2)));
-    document.querySelector('#doc-root [data-action="save-rules"]')?.addEventListener('click', () => { document.querySelectorAll('#doc-root [data-rule]').forEach(i => state.rules[i.dataset.rule] = Number(i.value)); save(STORE.rules, state.rules); updateStatus('Rules saved locally.'); render(); });
-    document.querySelector('#doc-root [data-action="clear"]')?.addEventListener('click', () => { state.capacity=[]; state.rules={...DEFAULT_RULES}; save(STORE.capacity, []); save(STORE.rules, {}); updateStatus('Local DOC data cleared.'); render(); });
-    document.getElementById('doc-csv')?.addEventListener('change', async event => { try { const count = importCapacityCsv(await event.target.files[0].text()).length; updateStatus(`${count} capacity records imported.`); state.activeTab='capacity'; render(); } catch (e) { updateStatus(e.message); } });
-  }
-
-  function collectContext() { const page = detectPage(); return { page, issue: page.type === 'jira-issue' ? extractJiraIssue() : null, scan: inspectPage() }; }
-  GM_addStyle(`
-    #doc-root{--bg:#101820;--panel:#fff;--ink:#182230;--muted:#596574;--brand:#5c2d91;--line:#d9dee7;--good:#107c10;--warn:#8a5a00;--bad:#b42318;position:fixed;right:16px;bottom:16px;z-index:2147483646;font:14px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}
-    #doc-toggle{width:56px;height:56px;border:0;border-radius:50%;background:var(--brand);color:white;font-weight:800;box-shadow:0 8px 28px #0005;cursor:pointer} #doc-panel{display:none;position:absolute;right:0;bottom:68px;width:min(420px,calc(100vw - 32px));height:min(720px,calc(100vh - 100px));background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 16px 48px #0005;overflow:hidden} #doc-root.open #doc-panel{display:grid;grid-template-rows:auto auto 1fr auto}
-    #doc-panel header{background:var(--bg);color:white;padding:14px 16px;display:flex;justify-content:space-between;align-items:center} #doc-panel header div{display:grid} #doc-panel header strong{font-size:22px} #doc-panel header span,#doc-panel header small{color:#d7deea}
-    #doc-panel nav{display:flex;overflow:auto;border-bottom:1px solid var(--line)} #doc-panel nav button{border:0;background:white;padding:10px 12px;cursor:pointer} #doc-panel nav button[aria-current="page"]{color:var(--brand);font-weight:700;border-bottom:3px solid var(--brand)} #doc-panel main{overflow:auto;padding:16px} #doc-panel footer{border-top:1px solid var(--line);padding:8px 14px;color:var(--muted);background:#f7f8fa}
-    #doc-root h2{font-size:16px;margin:14px 0 8px} #doc-root h3{font-size:14px;margin:0 0 4px} .doc-card,.doc-insight{border:1px solid var(--line);border-radius:10px;padding:12px;margin:8px 0;background:white}.doc-insight{border-left:5px solid #2b6cb0}.doc-insight.warning{border-left-color:var(--warn)}.doc-insight.critical{border-left-color:var(--bad)}.doc-insight.success{border-left-color:var(--good)}.doc-insight p{margin:0}.doc-row{display:flex;justify-content:space-between;gap:10px}.doc-mini,.doc-empty{color:var(--muted);font-size:12px}.doc-badge{border-radius:20px;padding:2px 8px;background:#e8eef7}.doc-badge.warning{background:#fff1cc;color:#6b4600}.doc-badge.critical{background:#fee4e2;color:#8a1c13}.doc-badge.success{background:#dff6dd;color:#0b5f0b}.doc-meter{height:7px;background:#e8ebef;border-radius:8px;overflow:hidden;margin:7px 0}.doc-meter span{display:block;height:100%;background:var(--brand)}.doc-kv div{display:grid;grid-template-columns:110px 1fr;border-bottom:1px solid var(--line);padding:7px 0}.doc-kv dt{font-weight:700}.doc-kv dd{margin:0;overflow-wrap:anywhere}.doc-actions{display:flex;gap:6px;flex-wrap:wrap}#doc-root button{font:inherit}#doc-root main button{background:var(--brand);color:white;border:0;border-radius:6px;padding:7px 10px;cursor:pointer}#doc-root label{display:grid;gap:4px;margin:8px 0}#doc-root input{padding:7px;border:1px solid var(--line);border-radius:6px}.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
-    @media (prefers-color-scheme:dark){#doc-root{--panel:#1b2430;--ink:#eef2f7;--muted:#b0bac8;--line:#3a4655}#doc-panel nav button,.doc-card,.doc-insight{background:#1b2430;color:var(--ink)}#doc-panel footer{background:#131b24}#doc-root input{background:#101820;color:white}}
-    @media (prefers-reduced-motion:reduce){#doc-root *{scroll-behavior:auto!important;transition:none!important}}
-  `);
-
-  let lastUrl = location.href;
-  const refresh = () => { state.context = collectContext(); render(); };
-  new MutationObserver(() => { if (location.href !== lastUrl) { lastUrl = location.href; setTimeout(refresh, 600); } }).observe(document.documentElement, { subtree:true, childList:true });
-  refresh();
-})();
+(()=>{'use strict';
+const V='0.4.0',K={rules:'doc4.rules',history:'doc4.history',snaps:'doc4.snaps',team:'doc4.team',dismissed:'doc4.dismissed'};
+const D={workdayHours:7,planningWeeks:3,stableMs:1400,timeoutMs:18000,maxPages:100,monitorDelayMs:300};
+const S={open:false,tab:'dashboard',rules:{...D,...get(K.rules,{})},history:get(K.history,[]),snaps:get(K.snaps,{}),team:get(K.team,[]),dismissed:get(K.dismissed,[]),running:false,abort:null,status:'Ready'};
+function get(k,f){try{const x=GM_getValue(k);return x?JSON.parse(x):f}catch{return f}} function put(k,v){GM_setValue(k,JSON.stringify(v))}
+const text=e=>(e?.innerText||e?.textContent||'').replace(/\s+/g,' ').trim(),vis=e=>!!e&&!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length),norm=x=>String(x||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim(),esc=x=>String(x??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])),wait=ms=>new Promise(r=>setTimeout(r,ms));
+function num(x){const m=String(x??'').replace(/,/g,'').match(/-?\d+(?:\.\d+)?/);return m?Number(m[0]):0} function invalid(x){return !x||/^(actions?|blocked|in progress|not ready|ready|overdue|total|unassigned|none)$/i.test(x)||/^\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}$/.test(x)||/^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d/i.test(x)}
+function main(){for(const q of ['main','[role="main"]','#content','.dashboard-content']){const e=[...document.querySelectorAll(q)].find(vis);if(e)return e}return document.body} function pageName(){const h=[...main().querySelectorAll('h1,[role="heading"][aria-level="1"]')].find(vis);return text(h)||document.title||'Dashboard'}
+function tables(){return[...main().querySelectorAll('table,[role="grid"],[role="table"]')].filter(vis)} function rows(t){return[...t.querySelectorAll('tr,[role="row"]')].filter(vis).map(r=>[...r.querySelectorAll(':scope>th,:scope>td,[role="columnheader"],[role="cell"],[role="gridcell"]')].map(text).filter(Boolean)).filter(r=>r.length>1)}
+function section(t){const box=t.closest('[data-testid*="dashboard-item"],section,article,[role="region"],.dashboard-item,.portlet')||t.parentElement;const h=[...box.querySelectorAll('h1,h2,h3,[role="heading"]')].find(vis);return{text:text(h)||'Untitled section',box}}
+function pager(t){const box=section(t).box,s=text(box),m=s.match(/(\d+)\s*[–-]\s*(\d+)\s+of\s+(\d+)/i);const next=[...box.querySelectorAll('button,a,[role="button"]')].find(e=>vis(e)&&!e.disabled&&/next/i.test(e.getAttribute('aria-label')||e.getAttribute('title')||text(e)));return{info:m?{from:+m[1],to:+m[2],total:+m[3]}:null,next}}
+function mark(e,label){document.querySelectorAll('.doc-scan-focus').forEach(x=>x.classList.remove('doc-scan-focus'));e?.classList.add('doc-scan-focus');e?.scrollIntoView({behavior:'smooth',block:'center'});S.status=label;const f=document.querySelector('#doc-root footer');if(f)f.textContent=label} function unmark(){document.querySelectorAll('.doc-scan-focus').forEach(x=>x.classList.remove('doc-scan-focus'))}
+async function changed(t,before){const start=Date.now();let stable=0,last=before;while(Date.now()-start<S.rules.timeoutMs){if(S.abort?.signal.aborted)throw new DOMException('Cancelled','AbortError');await wait(300);const now=rows(t).map(r=>r.join('|')).join('\n');if(now!==before&&now===last)stable+=300;else stable=0;last=now;if(stable>=S.rules.stableMs)return true}return false}
+function header(rs){let b=null;rs.slice(0,20).forEach((r,i)=>{const score=r.filter(c=>/assignee|summary|pages|modules|instances|vpat/i.test(c)).length;if(!b||score>b.score)b={i,row:r,score}});return b?.score>=2?b:null}
+function analyze(secMap){const people={},sections=[],warnings=[];for(const sec of secMap.values()){const h=header(sec.rows);let scope=0,findings=0,vpats=0,personCount=new Set();if(h){const hs=h.row.map(norm),ix=ps=>hs.findIndex(v=>ps.some(p=>p.test(v))),pi=ix([/^assignee$/]),si=ix([/^summary$/]),ci=ix([/^pages?$/,/^modules?$/,/page count/,/module count/]),fi=ix([/number of instances/,/^instances$/]),vi=ix([/^vpats?$/,/vpat count/]);if(pi<0)warnings.push(`${sec.title}: no Assignee column found.`);else for(const r of sec.rows.slice(h.i+1)){const name=(r[pi]||'').trim();if(invalid(name))continue;personCount.add(name);const p=people[name]??={name,scope:0,findings:0,vpats:0,items:0};const summary=r[si]||'';const sc=ci>=0?num(r[ci]):(/\b(?:module|page)\s*\d+\b/i.test(summary)?1:0);const fd=fi>=0?num(r[fi]):0, vp=vi>=0?num(r[vi]):(/\bvpat\b/i.test(summary)?1:0);p.scope+=sc;p.findings+=fd;p.vpats+=vp;p.items++;scope+=sc;findings+=fd;vpats+=vp}}sections.push({title:sec.title,pages:sec.pages,rows:Math.max(0,sec.rows.length-1),scope,findings,vpats,people:personCount.size})}return{name:pageName(),at:new Date().toISOString(),people:Object.values(people),sections,warnings}}
+async function scan(){if(S.running)return;S.running=true;S.abort=new AbortController();S.status='Scanning';render();const data=new Map(),warnings=[];try{for(const t of tables()){const {text:title}=section(t),sec={title,pages:0,rows:[],seen:new Set()};let page=1;while(page<=S.rules.maxPages){mark(t,`Reading ${title}, page ${page}`);await wait(S.rules.monitorDelayMs);for(const r of rows(t)){const k=r.join('\u241f');if(!sec.seen.has(k)){sec.seen.add(k);sec.rows.push(r)}}sec.pages=page;const p=pager(t);if(!p.next||(p.info&&p.info.to>=p.info.total))break;mark(p.next,`Loading page ${page+1} of ${title}`);const before=rows(t).map(r=>r.join('|')).join('\n');p.next.click();if(!await changed(t,before)){warnings.push(`${title}: Next did not load different rows after page ${page}.`);break}page++}data.set(title,sec)}const snap=analyze(data);snap.warnings.push(...warnings);const id=String(Date.now()),count=[...data.values()].reduce((a,x)=>a+x.rows.length,0);S.snaps[id]=snap;S.history=[{id,name:snap.name,at:snap.at,rows:count},...S.history].slice(0,20);put(K.snaps,S.snaps);put(K.history,S.history);S.status=`Scan complete: ${snap.sections.length} sections, ${count} unique rows.`}catch(e){S.status=e.name==='AbortError'?'Scan cancelled.':`Scan stopped: ${e.message}`}finally{unmark();S.running=false;render()}}
+function latest(){return S.snaps[S.history[0]?.id]} function teamSet(){return new Set(S.team.map(x=>norm(x.name)))} function availablePeople(s){const set=teamSet();return s.people.filter(p=>set.has(norm(p.name))&&!S.team.find(x=>norm(x.name)===norm(p.name)&&x.role==='manager'))}
+function gross(){const a=[],d=new Date();while(a.length<S.rules.planningWeeks*5){if(d.getDay()%6)a.push(new Date(d));d.setDate(d.getDate()+1)}return{days:a.length,hours:a.length*S.rules.workdayHours,end:a.at(-1)}}
+function dashboard(){const s=latest();if(!s)return`<section class="card"><h2>No scan results</h2><p>Open Scan and scan an Apollo dashboard.</p></section>`;const ppl=availablePeople(s),g=gross();return`<section class="card"><h2>${esc(s.name)}</h2><p class="muted">${new Date(s.at).toLocaleString()} · ${g.days} business days / ${g.hours} gross hours through ${g.end.toLocaleDateString()}</p></section>${s.warnings.map(w=>`<div class="notice">${esc(w)}</div>`).join('')}<section class="card"><h2>Team assignments</h2><div class="scroll"><table><thead><tr><th>Team member</th><th>Pages/modules</th><th>Findings</th><th>VPATs</th></tr></thead><tbody>${ppl.map(p=>`<tr><th>${esc(p.name)}</th><td>${p.scope}</td><td>${p.findings}</td><td>${p.vpats}</td></tr>`).join('')||'<tr><td colspan="4">Configure the roster in Settings.</td></tr>'}</tbody></table></div></section>`}
+function history(){return S.history.map(h=>{const x=S.snaps[h.id];return`<article class="card record"><details><summary><span><strong>${esc(h.name)}</strong><small>${new Date(h.at).toLocaleString()} · ${x?.sections?.length||0} sections · ${h.rows} rows</small></span><span aria-hidden="true">⌄</span></summary><div class="scroll"><table><thead><tr><th>Section</th><th>Pages</th><th>Rows</th><th>Pages/modules</th><th>Findings</th><th>VPATs</th></tr></thead><tbody>${(x?.sections||[]).map(z=>`<tr><th>${esc(z.title)}</th><td>${z.pages}</td><td>${z.rows}</td><td>${z.scope}</td><td>${z.findings}</td><td>${z.vpats}</td></tr>`).join('')}</tbody></table></div><div class="actions"><button class="secondary" data-view="${h.id}">View dashboard</button><button class="danger" data-delete="${h.id}">Delete scan</button></div></details></article>`}).join('')||'<p>No scans recorded.</p>'}
+function scanTab(){return`<section class="card"><h2>Scan dashboard</h2><p>DOC scans each dashboard section independently and follows that section’s pagination.</p><div class="actions"><button data-scan ${S.running?'disabled':''}>Scan main content</button><button class="secondary" data-cancel ${!S.running?'disabled':''}>Cancel</button></div></section><h2>Scan history</h2>${history()}`}
+function suggest(){const s=latest();if(!s)return'';const roster=teamSet(),dismissed=new Set(S.dismissed.map(norm)),list=s.people.filter(p=>!roster.has(norm(p.name))&&!dismissed.has(norm(p.name))&&!invalid(p.name));return`<section class="card"><h2>Suggested team members</h2><p class="muted">Only values from an Assignee column are suggested.</p><div class="scroll"><table class="suggest"><thead><tr><th>Assignee</th><th>Roster action</th><th>Other actions</th></tr></thead><tbody>${list.map(p=>`<tr><th>${esc(p.name)}</th><td class="right"><button data-add="${esc(p.name)}">Add to roster</button></td><td class="right"><button class="secondary" data-manager="${esc(p.name)}">Mark manager</button><button class="secondary" data-dismiss="${esc(p.name)}">Remove</button></td></tr>`).join('')||'<tr><td colspan="3">No new assignees detected.</td></tr>'}</tbody></table></div></section>`}
+function settings(){return`<section class="card"><h2>Team roster</h2>${S.team.map((p,i)=>`<div class="person"><span>${esc(p.name)}<small>${p.role==='manager'?'Manager · assignments treated as unassigned':'Team member'}</small></span><button class="secondary" data-remove="${i}">Remove</button></div>`).join('')||'<p>No roster configured.</p>'}<label>Add person<input id="person"></label><button data-add-manual>Add person</button></section>${suggest()}`}
+function busy(msg){let m=document.querySelector('#doc-root .mask');if(!m){m=document.createElement('div');m.className='mask';m.innerHTML='<div role="status" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span></span></div>';document.getElementById('doc-panel').append(m)}m.querySelector('span:last-child').textContent=msg;m.hidden=false} function graceful(msg,fn){const el=document.querySelector('#doc-root main'),top=el?.scrollTop||0;busy(msg);fn();setTimeout(()=>{render();document.querySelector('#doc-root main').scrollTop=top;S.status=msg.replace(/ing /,'ed ');document.querySelector('#doc-root footer').textContent=S.status},180)}
+function render(){let r=document.getElementById('doc-root');if(!r){r=document.createElement('section');r.id='doc-root';document.body.append(r)}const body=S.tab==='dashboard'?dashboard():S.tab==='scan'?scanTab():settings();r.className=S.open?'open':'';r.innerHTML=`<button id="launcher" aria-expanded="${S.open}"><b>D</b><span>${S.open?'Close DOC':'Open DOC'}</span></button><div id="doc-panel"><header><strong>DOC <small>${V}</small></strong><span>Delivery Operations Copilot</span></header><nav>${['dashboard','scan','settings'].map(t=>`<button data-tab="${t}" aria-current="${S.tab===t?'page':'false'}">${t[0].toUpperCase()+t.slice(1)}</button>`).join('')}</nav><main>${body}</main><footer role="status" aria-live="polite">${esc(S.status)}</footer></div>`;bind()}
+function bind(){document.getElementById('launcher').onclick=()=>{S.open=!S.open;render()};document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{S.tab=b.dataset.tab;render()});document.querySelector('[data-scan]')?.addEventListener('click',scan);document.querySelector('[data-cancel]')?.addEventListener('click',()=>S.abort?.abort());document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>{const i=S.history.findIndex(x=>x.id===b.dataset.view);if(i>0)S.history.unshift(S.history.splice(i,1)[0]);S.tab='dashboard';render()});document.querySelectorAll('[data-delete]').forEach(b=>b.onclick=()=>graceful('Deleting scan',()=>{delete S.snaps[b.dataset.delete];S.history=S.history.filter(x=>x.id!==b.dataset.delete);put(K.snaps,S.snaps);put(K.history,S.history)}));document.querySelectorAll('[data-add]').forEach(b=>b.onclick=()=>graceful(`Adding ${b.dataset.add} to roster`,()=>{S.team.push({name:b.dataset.add,role:'member'});put(K.team,S.team)}));document.querySelectorAll('[data-manager]').forEach(b=>b.onclick=()=>graceful(`Marking ${b.dataset.manager} as manager`,()=>{S.team.push({name:b.dataset.manager,role:'manager'});put(K.team,S.team)}));document.querySelectorAll('[data-dismiss]').forEach(b=>b.onclick=()=>graceful(`Removing ${b.dataset.dismiss} from suggestions`,()=>{S.dismissed.push(b.dataset.dismiss);put(K.dismissed,S.dismissed)}));document.querySelectorAll('[data-remove]').forEach(b=>b.onclick=()=>graceful('Removing roster entry',()=>{S.team.splice(+b.dataset.remove,1);put(K.team,S.team)}));document.querySelector('[data-add-manual]')?.addEventListener('click',()=>{const n=document.getElementById('person').value.trim();if(n)graceful(`Adding ${n} to roster`,()=>{S.team.push({name:n,role:'member'});put(K.team,S.team)})})}
+GM_addStyle(`#doc-root{--p:#4b1f7a;--ink:#18202b;--muted:#5b6775;--line:#d7dee8;position:fixed;right:88px;bottom:28px;z-index:2147483646;font:14px/1.45 system-ui;color:var(--ink)}#doc-root #launcher{display:flex;align-items:center;gap:8px;border:1px solid #9c77ce;border-radius:99px;background:#5b2aa5;color:#fff;padding:7px 13px 7px 7px;font-weight:700;box-shadow:0 8px 25px #0005}#doc-root #launcher b{display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:#ffffff20}#doc-root #doc-panel{display:none;position:absolute;right:0;bottom:54px;width:min(760px,calc(100vw - 40px));height:min(740px,calc(100vh - 90px));background:#fff;border:1px solid var(--line);border-radius:15px;box-shadow:0 20px 55px #0006;overflow:hidden}#doc-root.open #doc-panel{display:grid;grid-template-rows:auto auto 1fr auto}#doc-root header{display:grid;background:#18212c;color:#fff;padding:14px 18px}#doc-root header small{float:right;color:#cad3df}#doc-root nav{display:flex;border-bottom:1px solid var(--line)}#doc-root nav button{border:0;background:#fff;color:#253040;padding:11px 16px}#doc-root nav button[aria-current=page]{background:#4b1f7a;color:#fff;border-bottom:3px solid #e1c8ff;font-weight:700}#doc-root main{padding:18px;overflow:auto}#doc-root footer{border-top:1px solid var(--line);padding:9px 15px;color:var(--muted)}#doc-root h2{font-size:17px;margin:0 0 9px}#doc-root .card,#doc-root .notice{border:1px solid var(--line);border-radius:10px;padding:13px;margin-bottom:12px;background:#fff}#doc-root .notice{border-left:5px solid #a35e00}#doc-root table{width:100%;border-collapse:collapse}#doc-root th,#doc-root td{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}#doc-root .scroll{overflow:auto}#doc-root .muted,#doc-root small{display:block;color:var(--muted);font-size:12px}#doc-root .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}#doc-root main button{border:0;border-radius:7px;background:#5b2aa5;color:#fff;padding:8px 10px}#doc-root .secondary{background:#e8edf3!important;color:#253040!important}#doc-root .danger{background:#b42318!important;color:#fff!important}#doc-root .record summary{display:flex;justify-content:space-between;cursor:pointer;list-style:none}#doc-root .record summary span:first-child{display:grid}#doc-root .record summary::-webkit-details-marker{display:none}#doc-root .person{display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--line);padding:9px 0}#doc-root .person span{display:grid}#doc-root label{display:grid;gap:4px;margin:9px 0}#doc-root input{padding:8px}.right{text-align:right!important;white-space:nowrap}.right button+button{margin-left:6px}#doc-root .mask{position:absolute;inset:0;z-index:30;display:grid;place-items:center;background:#101820cc;backdrop-filter:blur(2px)}#doc-root .mask[hidden]{display:none}#doc-root .mask>div{display:flex;gap:10px;align-items:center;background:#fff;color:#18202b;padding:14px 18px;border-radius:10px}.spinner{width:20px;height:20px;border:3px solid #d3c8e2;border-top-color:#4b1f7a;border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.doc-scan-focus{outline:4px solid #ffb900!important;outline-offset:4px!important;box-shadow:0 0 0 8px #ffb90033!important}@media(prefers-color-scheme:dark){#doc-root{--ink:#eef2f7;--muted:#b6c0cc;--line:#44505e}#doc-root #doc-panel,#doc-root nav button,#doc-root .card{background:#18212c;color:var(--ink)}#doc-root nav button[aria-current=page]{background:#e1c8ff;color:#231033}#doc-root .secondary{background:#354252!important;color:#fff!important}}@media(prefers-reduced-motion:reduce){#doc-root *{animation:none!important;scroll-behavior:auto!important}}`);render();})();
