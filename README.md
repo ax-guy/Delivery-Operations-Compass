@@ -1,11 +1,15 @@
-# DOC v0.8.1
+# DOC v0.9.0
 
-- Adds Kanban page detection and scanning.
-- Expands all collapsed Jira swimlanes before collecting cards.
-- Attempts to set Jira's Assignee filter to only the person selected for Personal view.
-- Reads card key, summary, assignee, parent, due date, visible board status, and issue type.
-- Adds Kanban card records to the multi-dashboard store without replacing other dashboard data.
-- Personal view combines parent requests and subtasks across all latest dashboard sources.
-- Personal workload calculates estimated hours and labels work On track, At risk, or Unplanned.
-- Missing subtask due dates inherit a known parent due date when available.
-- Preserves all existing scanning, roster, capacity, history, export, and operational-reporting features.
+## TDD Calculator integration
+- Embeds the full service list, ATTC, buffer, Full Manual Evaluation page math, Validation findings adjustment, holiday/weekend skipping, date copying, and delivery-message copying from the existing TDD Calculator.
+- Suggests the Jira Created date as the calculator start date when found; otherwise uses today.
+- Adds a full accessible TDD dialog available from the DOC header.
+
+## Missing Jira due date
+- Detects CORE issue pages.
+- Checks whether a due date exists.
+- Highlights a missing due-date area.
+- Shows an accessible toggletip with suggested delivery date, Close, Expand, and Accept Date controls.
+- Accept Date opens Jira's due-date editor, enters the ISO date, and attempts to save.
+
+All existing DOC scanning, dashboard, roster, capacity, history, and Kanban functions are retained from the attached source.
