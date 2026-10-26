@@ -13,3 +13,5 @@
 - Three-week gross and remaining reference capacity
 - Editable scanner/capacity settings and reset defaults
 - Accessible status, processing mask, dark mode, reduced motion, scoped CSS
+- Forward-only pagination target selection using displayed range and paging query parameters
+- Pagination diagnostics with before/after ranges and candidate controls
