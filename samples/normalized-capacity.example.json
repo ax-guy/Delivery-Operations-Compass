@@ -1,0 +1,21 @@
+[
+  {
+    "name": "Sample Person",
+    "testingCapacityPct": 70,
+    "pagesAssigned": 10,
+    "evaluationHours": 45,
+    "validationFindings": 8,
+    "validationHoursPerFinding": 0.25,
+    "validationHours": 2,
+    "vpatCount": 0,
+    "vpatHours": 0,
+    "bookedHours": 47,
+    "ftoHours": 0,
+    "holidayHours": 0,
+    "firstAvailableDate": "2026-10-01",
+    "notes": "Sample only",
+    "potentialPages": 5,
+    "potentialHoursLeft": 20,
+    "smeHours": 0
+  }
+]
