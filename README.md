@@ -1,13 +1,11 @@
-# DOC v0.5.2
+# DOC v0.5.3
 
-## Critical scan fix
-v0.5.1 keyed scanned sections by their visible title. When multiple Jira gadgets did not expose a heading to the old selector, all were named “Untitled section” and each new section overwrote the previous one. This produced one result even when preflight found 11 sections.
-
-v0.5.2:
-- assigns every detected table a stable unique section key;
-- preserves every section even when titles repeat or are unavailable;
-- derives titles from Jira gadget containers, dashboard headers, ARIA labels, data titles, IDs, and nearby headings;
-- numbers duplicate section titles instead of merging them;
-- shows the complete preflight section inventory before scanning;
-- validates that result-section count equals preflight-section count and reports an integrity error if it does not;
-- retains all v0.5.1 functionality.
+## Pagination fix
+- Recognizes Jira AUI pagination anchors and buttons using accessible names, `rel="next"`, pagination classes, and paging query parameters.
+- Still excludes issue links, row actions, summaries, issue keys, and assignee links.
+- Activates the Next control within the current dashboard gadget only.
+- Waits for either the displayed range or table contents to change.
+- Handles Jira replacing the entire table element after pagination.
+- Waits for loading indicators to clear and the new rows to stabilize.
+- Confirms the range/page advanced before scanning the next page.
+- Reports a section-specific error when Next was activated but new rows did not load.
