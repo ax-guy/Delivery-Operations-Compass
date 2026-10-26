@@ -1,12 +1,13 @@
-# DOC Prototype v0.3.1
+# DOC v0.5.2
 
-## Fixes in this build
-- Apollo Health scans every visible table and uses the **Assignee** column in each table.
-- Overdue is calculated from the data rows in the **Overdue tickets** table.
-- Dashboard name comes from the page-level heading instead of the first gadget heading.
-- Detected assignees not already in the roster appear under **Suggested people found** with **Add to team** controls.
-- Active-tab colors now use a high-contrast foreground/background pair in light and dark modes.
-- DOC launcher moved upward to align better with Rovo.
-- Scan History includes **Delete scan** and removes both the history entry and saved snapshot.
-- All DOC component rules are scoped beneath `#doc-root`.
-- Scan highlighting no longer adds positioning or pseudo-content to Jira tables, preventing layout changes.
+## Critical scan fix
+v0.5.1 keyed scanned sections by their visible title. When multiple Jira gadgets did not expose a heading to the old selector, all were named “Untitled section” and each new section overwrote the previous one. This produced one result even when preflight found 11 sections.
+
+v0.5.2:
+- assigns every detected table a stable unique section key;
+- preserves every section even when titles repeat or are unavailable;
+- derives titles from Jira gadget containers, dashboard headers, ARIA labels, data titles, IDs, and nearby headings;
+- numbers duplicate section titles instead of merging them;
+- shows the complete preflight section inventory before scanning;
+- validates that result-section count equals preflight-section count and reports an integrity error if it does not;
+- retains all v0.5.1 functionality.
